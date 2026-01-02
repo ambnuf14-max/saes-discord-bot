@@ -1,0 +1,14 @@
+{
+  "mappings": [
+
+    {
+      "id": "example_mapping_1",
+      "source_server_id": "1327306157378895882",
+      "source_role_id": "1350364976682106982",
+      "target_server_id": "1456579736963645536",
+      "target_role_id": "1456636696186720415",
+      "description": "Los Santos Police Department Role",
+      "enabled": true
+    }
+  ]
+}

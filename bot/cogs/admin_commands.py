@@ -1,0 +1,472 @@
+"""
+Cog с административными командами для управления ботом
+"""
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+from typing import Optional
+import asyncio
+
+from bot.core.sync_engine import SyncEngine
+from bot.core.role_mapper import RoleMapper
+from bot.core.permissions import validate_all_servers, format_permissions_report
+from bot.ui.embeds import (
+    create_success_embed,
+    create_error_embed,
+    create_info_embed,
+    create_mapping_list_embed
+)
+from bot.config import RoleMapping
+from bot.utils.logger import get_logger
+from bot.utils.validators import validate_server_id, validate_role_id
+
+logger = get_logger("cogs.admin_commands")
+
+
+class AdminCommandsCog(commands.Cog):
+    """Cog с административными командами"""
+
+    def __init__(self, bot):
+        """
+        Инициализация Cog
+
+        Args:
+            bot: Объект бота
+        """
+        self.bot = bot
+        self.sync_engine: Optional[SyncEngine] = None
+        self.role_mapper: Optional[RoleMapper] = None
+
+    async def cog_load(self):
+        """Вызывается когда Cog загружается"""
+        logger.info("AdminCommandsCog загружен")
+
+        # Создаем RoleMapper и SyncEngine
+        self.role_mapper = RoleMapper(self.bot.config, self.bot.db)
+        await self.role_mapper.initialize()
+
+        self.sync_engine = SyncEngine(
+            bot=self.bot,
+            config=self.bot.config,
+            db=self.bot.db,
+            role_mapper=self.role_mapper
+        )
+
+    @commands.hybrid_group(name="roleadmin", invoke_without_command=True, description="Команды администрирования ролей")
+    @commands.has_permissions(administrator=True)
+    async def role_admin(self, ctx: commands.Context):
+        """
+        Группа команд администрирования ролей
+
+        Использование: !roleadmin <подкоманда> или /roleadmin <подкоманда>
+        """
+        if ctx.invoked_subcommand is None:
+            help_text = (
+                "**Доступные команды администрирования:**\n\n"
+                "`/roleadmin sync_all` - Синхронизировать всех пользователей\n"
+                "`/roleadmin sync_user <ID>` - Синхронизировать конкретного пользователя\n"
+                "`/roleadmin list_mappings` - Показать все маппинги ролей\n"
+                "`/roleadmin add_mapping` - Добавить маппинг роли\n"
+                "`/roleadmin remove_mapping <ID>` - Удалить маппинг\n"
+                "`/roleadmin reload_config` - Перезагрузить конфигурацию\n"
+                "`/roleadmin check_permissions` - Проверить права бота\n"
+                "`/roleadmin debug_user <ID>` - Диагностика пользователя\n"
+            )
+            await ctx.send(embed=create_info_embed(help_text, "Команды администрирования"), ephemeral=True)
+
+    @role_admin.command(name="sync_all", description="Синхронизировать всех пользователей на главном сервере")
+    async def sync_all_users(self, ctx: commands.Context):
+        """Синхронизировать всех пользователей на главном сервере"""
+        # Проверяем включена ли массовая синхронизация в конфиге
+        if not self.bot.config.is_batch_sync_enabled():
+            await ctx.send(
+                embed=create_error_embed(
+                    "Массовая синхронизация отключена в конфигурации.",
+                    "Функция недоступна"
+                ),
+                ephemeral=True
+            )
+            return
+
+        # Подтверждение
+        main_server_id = self.bot.config.get_main_server_id()
+        guild = self.bot.get_guild(main_server_id)
+
+        if not guild:
+            await ctx.send(embed=create_error_embed("Главный сервер не найден."), ephemeral=True)
+            return
+
+        # Считаем количество пользователей
+        non_bot_members = [m for m in guild.members if not m.bot]
+        member_count = len(non_bot_members)
+
+        confirm_msg = await ctx.send(
+            embed=create_info_embed(
+                f"Вы собираетесь синхронизировать **{member_count}** пользователей.\n"
+                f"Это может занять некоторое время.\n\n"
+                f"Продолжить? Напишите `да` для подтверждения (30 сек).",
+                "Подтверждение массовой синхронизации"
+            ),
+            ephemeral=True
+        )
+
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel
+
+        try:
+            msg = await self.bot.wait_for('message', check=check, timeout=30.0)
+            if msg.content.lower() not in ['да', 'yes', 'y', 'д']:
+                await ctx.send("❌ Массовая синхронизация отменена.", ephemeral=True)
+                return
+        except asyncio.TimeoutError:
+            await ctx.send("⏱️ Время ожидания истекло. Массовая синхронизация отменена.", ephemeral=True)
+            return
+
+        # Выполняем массовую синхронизацию
+        progress_msg = await ctx.send(
+            embed=create_info_embed("⏳ Начинаем массовую синхронизацию...", "В процессе"),
+            ephemeral=True
+        )
+
+        try:
+            stats = await self.sync_engine.sync_all_users(guild_id=main_server_id)
+
+            # Отправляем результаты
+            result_text = (
+                f"**Результаты массовой синхронизации:**\n\n"
+                f"✅ Успешно: {stats.get('success', 0)}\n"
+                f"❌ Ошибок: {stats.get('failed', 0)}\n"
+                f"⏭️ Пропущено (боты): {stats.get('skipped', 0)}\n"
+                f"📊 Всего обработано: {stats.get('total', 0)}"
+            )
+
+            await progress_msg.edit(
+                embed=create_success_embed(result_text, "Массовая синхронизация завершена")
+            )
+
+            logger.info(
+                f"Массовая синхронизация выполнена пользователем {ctx.author}: {stats}"
+            )
+
+        except Exception as e:
+            logger.error(f"Ошибка массовой синхронизации: {e}", exc_info=True)
+            await progress_msg.edit(
+                embed=create_error_embed(f"Ошибка при массовой синхронизации: {e}")
+            )
+
+    @role_admin.command(name="sync_user", description="Синхронизировать конкретного пользователя")
+    @app_commands.describe(user_id="ID пользователя Discord")
+    async def sync_specific_user(self, ctx: commands.Context, user_id: int):
+        """Синхронизировать конкретного пользователя"""
+        try:
+            # Выполняем синхронизацию
+            result = await self.sync_engine.sync_user_roles(
+                user_id=user_id,
+                trigger_type="manual"
+            )
+
+            if result.success:
+                result_text = (
+                    f"**Синхронизация пользователя `{user_id}` завершена:**\n\n"
+                    f"➕ Добавлено ролей: {len(result.roles_added)}\n"
+                    f"➖ Удалено ролей: {len(result.roles_removed)}\n"
+                    f"📊 Проверено серверов: {len(result.source_servers)}"
+                )
+                await ctx.send(embed=create_success_embed(result_text), ephemeral=True)
+            else:
+                await ctx.send(
+                    embed=create_error_embed(
+                        f"Синхронизация завершена с ошибками:\n" + "\n".join(result.errors)
+                    ),
+                    ephemeral=True
+                )
+
+            logger.info(f"Ручная синхронизация пользователя {user_id} выполнена {ctx.author}")
+
+        except Exception as e:
+            logger.error(f"Ошибка синхронизации пользователя {user_id}: {e}", exc_info=True)
+            await ctx.send(embed=create_error_embed(f"Ошибка: {e}"), ephemeral=True)
+
+    @role_admin.command(name="list_mappings", description="Показать все маппинги ролей")
+    async def list_mappings(self, ctx: commands.Context):
+        """Показать все маппинги ролей"""
+        try:
+            mappings = await self.bot.db.get_all_mappings()
+
+            if not mappings:
+                await ctx.send(
+                    embed=create_info_embed(
+                        "Маппинги ролей не настроены.\n"
+                        "Используйте `!roleadmin add_mapping` для добавления.",
+                        "Список маппингов пуст"
+                    ),
+                    ephemeral=True
+                )
+                return
+
+            # Создаем embed со списком
+            embed = create_mapping_list_embed([dict(m) for m in mappings])
+            await ctx.send(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"Ошибка получения списка маппингов: {e}", exc_info=True)
+            await ctx.send(embed=create_error_embed(f"Ошибка: {e}"), ephemeral=True)
+
+    @role_admin.command(name="add_mapping", description="Добавить новый маппинг роли")
+    @app_commands.describe(
+        mapping_id="Уникальный ID маппинга",
+        source_server="ID исходного сервера",
+        source_role="ID исходной роли",
+        target_role="ID целевой роли",
+        description="Описание маппинга"
+    )
+    async def add_mapping(
+        self,
+        ctx: commands.Context,
+        mapping_id: str,
+        source_server: int,
+        source_role: int,
+        target_role: int,
+        *,
+        description: str = ""
+    ):
+        """Добавить новый маппинг роли"""
+        try:
+            # Валидация
+            if not validate_server_id(source_server):
+                await ctx.send(embed=create_error_embed("Некорректный ID исходного сервера."), ephemeral=True)
+                return
+
+            if not validate_role_id(source_role) or not validate_role_id(target_role):
+                await ctx.send(embed=create_error_embed("Некорректный ID роли."), ephemeral=True)
+                return
+
+            # Добавляем маппинг
+            main_server_id = self.bot.config.get_main_server_id()
+
+            await self.role_mapper.add_mapping(
+                mapping_id=mapping_id,
+                source_server_id=source_server,
+                source_role_id=source_role,
+                target_server_id=main_server_id,
+                target_role_id=target_role,
+                description=description,
+                enabled=True
+            )
+
+            await ctx.send(
+                embed=create_success_embed(
+                    f"Маппинг `{mapping_id}` успешно добавлен!",
+                    "Маппинг добавлен"
+                ),
+                ephemeral=True
+            )
+
+            logger.info(f"Маппинг {mapping_id} добавлен пользователем {ctx.author}")
+
+        except Exception as e:
+            logger.error(f"Ошибка добавления маппинга: {e}", exc_info=True)
+            await ctx.send(embed=create_error_embed(f"Ошибка: {e}"), ephemeral=True)
+
+    @role_admin.command(name="remove_mapping", description="Удалить маппинг роли")
+    @app_commands.describe(mapping_id="ID маппинга для удаления")
+    async def remove_mapping(self, ctx: commands.Context, mapping_id: str):
+        """Удалить маппинг роли"""
+        try:
+            success = await self.role_mapper.remove_mapping(mapping_id)
+
+            if success:
+                await ctx.send(
+                    embed=create_success_embed(
+                        f"Маппинг `{mapping_id}` успешно удален!",
+                        "Маппинг удален"
+                    ),
+                    ephemeral=True
+                )
+                logger.info(f"Маппинг {mapping_id} удален пользователем {ctx.author}")
+            else:
+                await ctx.send(
+                    embed=create_error_embed(
+                        f"Маппинг `{mapping_id}` не найден.",
+                        "Маппинг не найден"
+                    ),
+                    ephemeral=True
+                )
+
+        except Exception as e:
+            logger.error(f"Ошибка удаления маппинга: {e}", exc_info=True)
+            await ctx.send(embed=create_error_embed(f"Ошибка: {e}"), ephemeral=True)
+
+    @role_admin.command(name="reload_config", description="Перезагрузить конфигурацию из файлов")
+    async def reload_config(self, ctx: commands.Context):
+        """Перезагрузить конфигурацию из файлов"""
+        try:
+            # Перезагружаем маппинги
+            await self.role_mapper.reload_mappings()
+
+            await ctx.send(
+                embed=create_success_embed(
+                    "Конфигурация успешно перезагружена!",
+                    "Конфигурация обновлена"
+                ),
+                ephemeral=True
+            )
+
+            logger.info(f"Конфигурация перезагружена пользователем {ctx.author}")
+
+        except Exception as e:
+            logger.error(f"Ошибка перезагрузки конфигурации: {e}", exc_info=True)
+            await ctx.send(embed=create_error_embed(f"Ошибка: {e}"), ephemeral=True)
+
+    @role_admin.command(name="check_permissions", description="Проверить права бота на всех серверах")
+    async def check_permissions(self, ctx: commands.Context):
+        """Проверить права бота на всех серверах"""
+        try:
+            await ctx.send(embed=create_info_embed("⏳ Проверка прав...", "В процессе"), ephemeral=True)
+
+            # Проверяем права на всех серверах
+            validation_results = await validate_all_servers(self.bot)
+
+            if not validation_results:
+                await ctx.send(
+                    embed=create_success_embed(
+                        "✅ Все права в порядке на всех серверах!",
+                        "Проверка прав завершена"
+                    ),
+                    ephemeral=True
+                )
+            else:
+                # Формируем отчет о проблемах
+                report = format_permissions_report(validation_results)
+
+                # Если отчет слишком длинный, разбиваем на части
+                if len(report) > 1900:
+                    report = report[:1900] + "\n\n... (отчет обрезан, проверьте логи)"
+
+                await ctx.send(
+                    embed=create_error_embed(report, "Обнаружены проблемы с правами"),
+                    ephemeral=True
+                )
+
+            logger.info(f"Проверка прав выполнена пользователем {ctx.author}")
+
+        except Exception as e:
+            logger.error(f"Ошибка проверки прав: {e}", exc_info=True)
+            await ctx.send(embed=create_error_embed(f"Ошибка: {e}"), ephemeral=True)
+
+    @role_admin.command(name="mapper_stats", description="Показать статистику по маппингам")
+    async def mapper_stats(self, ctx: commands.Context):
+        """Показать статистику по маппингам"""
+        try:
+            stats = self.role_mapper.get_stats()
+
+            stats_text = (
+                f"**Статистика маппингов ролей:**\n\n"
+                f"📊 Всего маппингов: {stats['total_mappings']}\n"
+                f"✅ Активных: {stats['enabled_mappings']}\n"
+                f"❌ Отключенных: {stats['disabled_mappings']}\n"
+                f"🌐 Уникальных исходных серверов: {stats['unique_source_servers']}"
+            )
+
+            await ctx.send(embed=create_info_embed(stats_text, "Статистика маппингов"), ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики маппингов: {e}", exc_info=True)
+            await ctx.send(embed=create_error_embed(f"Ошибка: {e}"), ephemeral=True)
+
+    @role_admin.command(name="debug_user", description="Показать детальную информацию о ролях пользователя")
+    @app_commands.describe(user_id="ID пользователя Discord")
+    async def debug_user(self, ctx: commands.Context, user_id: int):
+        """Показать детальную информацию о ролях пользователя на всех серверах"""
+        try:
+            # Получаем все сервера где есть пользователь
+            mutual_guilds = await self.sync_engine.get_user_mutual_guilds(user_id)
+
+            embed = discord.Embed(
+                title=f"🔍 Диагностика пользователя {user_id}",
+                color=0x3498db
+            )
+
+            # Главный сервер
+            main_server_id = self.bot.config.get_main_server_id()
+            main_guild = self.bot.get_guild(main_server_id)
+
+            if main_guild:
+                try:
+                    main_member = await main_guild.fetch_member(user_id)
+                    roles_text = []
+                    for role in main_member.roles:
+                        if not role.is_default():
+                            roles_text.append(f"{role.mention} (`{role.id}`)")
+
+                    embed.add_field(
+                        name=f"👑 Главный сервер: {main_guild.name}",
+                        value="\n".join(roles_text) if roles_text else "Нет ролей",
+                        inline=False
+                    )
+                except:
+                    embed.add_field(
+                        name=f"👑 Главный сервер: {main_guild.name}",
+                        value="❌ Пользователь не найден",
+                        inline=False
+                    )
+
+            # Другие сервера
+            for guild in mutual_guilds:
+                try:
+                    member = await guild.fetch_member(user_id)
+                    roles_text = []
+                    for role in member.roles:
+                        if not role.is_default():
+                            roles_text.append(f"{role.name} (`{role.id}`)")
+
+                    embed.add_field(
+                        name=f"🌐 {guild.name} (`{guild.id}`)",
+                        value="\n".join(roles_text[:10]) if roles_text else "Нет ролей",
+                        inline=False
+                    )
+                except:
+                    continue
+
+            # Проверяем маппинги
+            user_roles_map = await self.sync_engine.get_user_roles_from_guilds(user_id, mutual_guilds)
+            target_roles = await self.sync_engine.calculate_target_roles(user_roles_map)
+
+            embed.add_field(
+                name="🎯 Целевые роли (должны быть назначены)",
+                value=f"{len(target_roles)} ролей: {', '.join(f'`{r}`' for r in target_roles)}" if target_roles else "Нет",
+                inline=False
+            )
+
+            await ctx.send(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"Ошибка диагностики пользователя: {e}", exc_info=True)
+            await ctx.send(embed=create_error_embed(f"Ошибка: {e}"), ephemeral=True)
+
+    @role_admin.error
+    async def role_admin_error(self, ctx: commands.Context, error: Exception):
+        """Обработчик ошибок группы команд role_admin"""
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send(
+                embed=create_error_embed(
+                    "У вас нет прав администратора для использования этой команды.",
+                    "Недостаточно прав"
+                ),
+                ephemeral=True
+            )
+        else:
+            logger.error(f"Ошибка в команде role_admin: {error}", exc_info=True)
+            await ctx.send(embed=create_error_embed(f"Произошла ошибка: {error}"), ephemeral=True)
+
+
+async def setup(bot):
+    """
+    Функция для загрузки Cog
+
+    Args:
+        bot: Объект бота
+    """
+    await bot.add_cog(AdminCommandsCog(bot))
+    logger.info("AdminCommandsCog добавлен в бота")

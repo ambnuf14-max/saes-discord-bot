@@ -1,0 +1,49 @@
+# Systemd service file для Discord Role Sync Bot
+#
+# Установка:
+# 1. Отредактируйте этот файл, заменив /path/to/bot на реальный путь
+# 2. Скопируйте в systemd: sudo cp discord-bot.service /etc/systemd/system/
+# 3. Перезагрузите systemd: sudo systemctl daemon-reload
+# 4. Включите автозапуск: sudo systemctl enable discord-bot
+# 5. Запустите сервис: sudo systemctl start discord-bot
+#
+# Управление:
+# - Статус: sudo systemctl status discord-bot
+# - Остановить: sudo systemctl stop discord-bot
+# - Перезапустить: sudo systemctl restart discord-bot
+# - Логи: sudo journalctl -u discord-bot -f
+
+[Unit]
+Description=Discord Role Synchronization Bot
+After=network.target
+
+[Service]
+Type=simple
+
+# ЗАМЕНИТЕ на ваш путь к боту
+WorkingDirectory=/path/to/saes-discord-bot
+
+# ЗАМЕНИТЕ на вашего пользователя
+User=your-username
+
+# Используем виртуальное окружение
+ExecStart=/path/to/saes-discord-bot/venv/bin/python /path/to/saes-discord-bot/run.py
+
+# Автоматический перезапуск при сбое
+Restart=on-failure
+RestartSec=10
+
+# Лимиты
+LimitNOFILE=4096
+
+# Переменные окружения (опционально, если не используете .env)
+# Environment="DISCORD_BOT_TOKEN=your_token_here"
+# Environment="ENVIRONMENT=production"
+
+# Логирование
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=discord-bot
+
+[Install]
+WantedBy=multi-user.target
