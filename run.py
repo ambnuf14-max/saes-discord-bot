@@ -16,8 +16,8 @@ from bot.utils.logger import setup_logging
 from bot.main import RoleSyncBot
 
 
-def main():
-    """Главная функция запуска бота"""
+async def async_main():
+    """Асинхронная главная функция запуска бота"""
 
     # Загружаем переменные окружения из .env файла
     load_dotenv()
@@ -40,15 +40,33 @@ def main():
         sys.exit(1)
 
     # Создаем и запускаем бота
+    bot = None
     try:
         bot = RoleSyncBot()
-        bot.run(bot_token)
+        async with bot:
+            await bot.start(bot_token)
 
     except KeyboardInterrupt:
-        logger.info("Бот остановлен пользователем (Ctrl+C)")
+        logger.info("Получен сигнал остановки (Ctrl+C)")
 
     except Exception as e:
         logger.critical(f"Критическая ошибка бота: {e}", exc_info=True)
+        raise
+
+    finally:
+        if bot:
+            logger.info("Завершение работы бота...")
+
+
+def main():
+    """Главная функция запуска бота"""
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        # Игнорируем, уже обработано в async_main
+        pass
+    except Exception as e:
+        logging.critical(f"Критическая ошибка: {e}", exc_info=True)
         sys.exit(1)
 
 

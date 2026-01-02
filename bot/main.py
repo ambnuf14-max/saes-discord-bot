@@ -182,5 +182,15 @@ class RoleSyncBot(commands.Bot):
     async def close(self):
         """Корректное закрытие бота"""
         logger.info("Закрытие бота...")
+
+        # Закрываем соединение с БД
+        if self.db:
+            try:
+                await self.db.close()
+                logger.info("База данных закрыта")
+            except Exception as e:
+                logger.error(f"Ошибка закрытия БД: {e}", exc_info=True)
+
+        # Закрываем Discord соединение
         await super().close()
         logger.info("Бот остановлен")
