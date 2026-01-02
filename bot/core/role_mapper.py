@@ -25,6 +25,8 @@ class RoleMapper:
         self.config = config
         self.db = db
         self._mapping_cache: Dict[Tuple[int, int], int] = {}
+        # Обратный индекс: множество всех целевых ролей для быстрой проверки O(1)
+        self._target_roles_set: set = set()
         self._initialized = False
 
     async def initialize(self):
@@ -43,8 +45,9 @@ class RoleMapper:
             # Получаем все маппинги из БД
             mappings = await self.db.get_all_mappings()
 
-            # Очищаем старый кеш
+            # Очищаем старые кеши
             self._mapping_cache.clear()
+            self._target_roles_set.clear()
 
             # Загружаем в кеш только активные маппинги
             for mapping in mappings:
@@ -56,6 +59,8 @@ class RoleMapper:
 
                     key = (source_server_id, source_role_id)
                     self._mapping_cache[key] = target_role_id
+                    # Добавляем в обратный индекс
+                    self._target_roles_set.add(target_role_id)
 
                     # Детальное логирование только в DEBUG режиме
                     logger.debug(
@@ -63,7 +68,10 @@ class RoleMapper:
                         f"роль {source_role_id} -> целевая роль {target_role_id}"
                     )
 
-            logger.info(f"Загружено {len(self._mapping_cache)} активных маппингов в кеш")
+            logger.info(
+                f"Загружено {len(self._mapping_cache)} активных маппингов в кеш, "
+                f"{len(self._target_roles_set)} уникальных целевых ролей"
+            )
 
         except Exception as e:
             logger.error(f"Ошибка загрузки маппингов: {e}", exc_info=True)
@@ -166,6 +174,18 @@ class RoleMapper:
         key = (source_server_id, source_role_id)
         return key in self._mapping_cache
 
+    def is_target_role(self, role_id: int) -> bool:
+        """
+        Проверить является ли роль целевой (O(1) через обратный индекс)
+
+        Args:
+            role_id: ID роли для проверки
+
+        Returns:
+            True если роль является целевой в каком-либо маппинге
+        """
+        return role_id in self._target_roles_set
+
     async def add_mapping(
         self,
         mapping_id: str,
@@ -221,6 +241,7 @@ class RoleMapper:
             if enabled:
                 key = (source_server_id, source_role_id)
                 self._mapping_cache[key] = target_role_id
+                self._target_roles_set.add(target_role_id)
 
             logger.info(f"Добавлен новый маппинг: {mapping_id}")
             return True
@@ -254,7 +275,12 @@ class RoleMapper:
 
             # Удаляем из кеша в памяти
             key = (mapping.source_server_id, mapping.source_role_id)
-            self._mapping_cache.pop(key, None)
+            removed_target = self._mapping_cache.pop(key, None)
+
+            # Обновляем обратный индекс - удаляем если больше нет ссылок на эту целевую роль
+            if removed_target is not None:
+                if removed_target not in self._mapping_cache.values():
+                    self._target_roles_set.discard(removed_target)
 
             logger.info(f"Удален маппинг: {mapping_id}")
             return True
@@ -311,8 +337,13 @@ class RoleMapper:
             key = (mapping.source_server_id, mapping.source_role_id)
             if mapping.enabled:
                 self._mapping_cache[key] = mapping.target_role_id
+                self._target_roles_set.add(mapping.target_role_id)
             else:
-                self._mapping_cache.pop(key, None)
+                removed_target = self._mapping_cache.pop(key, None)
+                # Удаляем из обратного индекса если нет других ссылок
+                if removed_target is not None:
+                    if removed_target not in self._mapping_cache.values():
+                        self._target_roles_set.discard(removed_target)
 
             logger.info(f"Обновлен маппинг: {mapping_id}")
             return True

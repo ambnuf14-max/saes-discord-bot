@@ -22,41 +22,54 @@ class DatabaseOperations:
             db_path: Путь к файлу базы данных
         """
         self.db_path = db_path
+        self._connection: Optional[aiosqlite.Connection] = None
+
+    async def connect(self) -> None:
+        """Установить постоянное подключение к БД"""
+        if self._connection is None:
+            self._connection = await aiosqlite.connect(self.db_path)
+            self._connection.row_factory = aiosqlite.Row
+            # Оптимизации SQLite
+            await self._connection.execute("PRAGMA journal_mode=WAL")
+            await self._connection.execute("PRAGMA synchronous=NORMAL")
+            await self._connection.execute("PRAGMA cache_size=10000")
+            logger.info("Подключение к БД установлено")
+
+    async def close(self) -> None:
+        """Закрыть подключение к БД"""
+        if self._connection:
+            await self._connection.close()
+            self._connection = None
+            logger.info("Подключение к БД закрыто")
+
+    async def _get_connection(self) -> aiosqlite.Connection:
+        """Получить подключение (создать если не существует)"""
+        if self._connection is None:
+            await self.connect()
+        return self._connection
 
     async def _execute(self, query: str, params: tuple = ()) -> aiosqlite.Cursor:
-        """
-        Выполнить SQL запрос
-
-        Args:
-            query: SQL запрос
-            params: Параметры запроса
-
-        Returns:
-            Cursor объект
-        """
+        """Выполнить SQL запрос"""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                db.row_factory = aiosqlite.Row
-                cursor = await db.execute(query, params)
-                await db.commit()
-                return cursor
+            db = await self._get_connection()
+            cursor = await db.execute(query, params)
+            await db.commit()
+            return cursor
         except Exception as e:
             logger.error(f"Ошибка выполнения запроса: {e}", exc_info=True)
             raise DatabaseError(f"Database error: {e}")
 
     async def _fetchone(self, query: str, params: tuple = ()) -> Optional[aiosqlite.Row]:
         """Выполнить запрос и вернуть одну строку"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(query, params) as cursor:
-                return await cursor.fetchone()
+        db = await self._get_connection()
+        async with db.execute(query, params) as cursor:
+            return await cursor.fetchone()
 
     async def _fetchall(self, query: str, params: tuple = ()) -> List[aiosqlite.Row]:
         """Выполнить запрос и вернуть все строки"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(query, params) as cursor:
-                return await cursor.fetchall()
+        db = await self._get_connection()
+        async with db.execute(query, params) as cursor:
+            return await cursor.fetchall()
 
     # ============ Sync State Operations ============
 
@@ -230,7 +243,7 @@ class DatabaseOperations:
         user_id: int
     ) -> None:
         """
-        Обновить статистику за сегодня
+        Обновить статистику за сегодня (оптимизировано - 1 запрос вместо 5-6)
 
         Args:
             trigger_type: Тип триггера синхронизации
@@ -240,46 +253,32 @@ class DatabaseOperations:
         """
         today = date.today().isoformat()
 
-        # Создаем или обновляем запись за сегодня
+        # Определяем значения для инкремента
+        button_inc = 1 if trigger_type == "button" else 0
+        auto_inc = 1 if trigger_type == "auto" else 0
+        manual_inc = 1 if trigger_type == "manual" else 0
+        success_inc = 1 if success else 0
+        failed_inc = 0 if success else 1
+
+        # Один запрос вместо 5-6
         query = """
         INSERT INTO statistics (
             stat_date, total_syncs, button_syncs, auto_syncs, manual_syncs,
             successful_syncs, failed_syncs, unique_users_synced, total_roles_assigned
-        ) VALUES (?, 1, 0, 0, 0, 0, 0, 0, ?)
+        ) VALUES (?, 1, ?, ?, ?, ?, ?, 0, ?)
         ON CONFLICT(stat_date) DO UPDATE SET
             total_syncs = total_syncs + 1,
+            button_syncs = button_syncs + ?,
+            auto_syncs = auto_syncs + ?,
+            manual_syncs = manual_syncs + ?,
+            successful_syncs = successful_syncs + ?,
+            failed_syncs = failed_syncs + ?,
             total_roles_assigned = total_roles_assigned + ?
         """
-        await self._execute(query, (today, roles_assigned, roles_assigned))
-
-        # Обновляем счетчики в зависимости от типа триггера
-        if trigger_type == "button":
-            await self._execute(
-                "UPDATE statistics SET button_syncs = button_syncs + 1 WHERE stat_date = ?",
-                (today,)
-            )
-        elif trigger_type == "auto":
-            await self._execute(
-                "UPDATE statistics SET auto_syncs = auto_syncs + 1 WHERE stat_date = ?",
-                (today,)
-            )
-        elif trigger_type == "manual":
-            await self._execute(
-                "UPDATE statistics SET manual_syncs = manual_syncs + 1 WHERE stat_date = ?",
-                (today,)
-            )
-
-        # Обновляем счетчик успешных/неуспешных синхронизаций
-        if success:
-            await self._execute(
-                "UPDATE statistics SET successful_syncs = successful_syncs + 1 WHERE stat_date = ?",
-                (today,)
-            )
-        else:
-            await self._execute(
-                "UPDATE statistics SET failed_syncs = failed_syncs + 1 WHERE stat_date = ?",
-                (today,)
-            )
+        await self._execute(query, (
+            today, button_inc, auto_inc, manual_inc, success_inc, failed_inc, roles_assigned,
+            button_inc, auto_inc, manual_inc, success_inc, failed_inc, roles_assigned
+        ))
 
     async def get_statistics_summary(self, days: int = 30) -> Dict:
         """

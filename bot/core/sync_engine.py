@@ -3,6 +3,7 @@
 """
 
 import discord
+import asyncio
 from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass
 from datetime import datetime
@@ -121,8 +122,8 @@ class SyncEngine:
                 await self._log_sync_event(user_id, "sync_failed", trigger_type, False, error_message=error_msg)
                 raise UserNotFoundError(error_msg)
 
-            # 3. Получаем все сервера где есть пользователь и бот
-            mutual_guilds = await self.get_user_mutual_guilds(user_id)
+            # 3. Получаем все сервера и роли пользователя (один параллельный запрос)
+            mutual_guilds, user_roles_map = await self.get_user_roles_from_all_guilds(user_id)
             logger.info(f"Пользователь найден на {len(mutual_guilds)} общих серверах")
 
             if not mutual_guilds:
@@ -131,8 +132,7 @@ class SyncEngine:
                 await self._log_sync_event(user_id, "sync_success", trigger_type, True)
                 return result
 
-            # 4. Собираем роли пользователя со всех серверов
-            user_roles_map = await self.get_user_roles_from_guilds(user_id, mutual_guilds)
+            # 4. Роли уже собраны в предыдущем шаге
             result.source_servers = list(user_roles_map.keys())
             result.source_roles_found = user_roles_map  # Сохраняем диагностическую информацию
 
@@ -192,6 +192,71 @@ class SyncEngine:
 
         return result
 
+    async def _fetch_member_safe(
+        self,
+        guild: discord.Guild,
+        user_id: int
+    ) -> Optional[discord.Member]:
+        """
+        Безопасно получить участника сервера
+
+        Args:
+            guild: Сервер
+            user_id: ID пользователя
+
+        Returns:
+            Member или None если не найден
+        """
+        try:
+            return await guild.fetch_member(user_id)
+        except discord.NotFound:
+            return None
+        except Exception as e:
+            logger.warning(f"Ошибка получения участника на сервере {guild.name}: {e}")
+            return None
+
+    async def get_user_roles_from_all_guilds(
+        self,
+        user_id: int
+    ) -> Tuple[List[discord.Guild], Dict[int, List[int]]]:
+        """
+        Получить роли пользователя со всех серверов (параллельно)
+
+        Args:
+            user_id: ID пользователя
+
+        Returns:
+            Кортеж (список серверов где найден, словарь {server_id: [role_ids]})
+        """
+        main_server_id = self.config.get_main_server_id()
+
+        # Фильтруем сервера (исключаем главный)
+        guilds_to_check = [g for g in self.bot.guilds if g.id != main_server_id]
+
+        if not guilds_to_check:
+            return [], {}
+
+        # Параллельно запрашиваем всех участников
+        tasks = [self._fetch_member_safe(guild, user_id) for guild in guilds_to_check]
+        results = await asyncio.gather(*tasks)
+
+        mutual_guilds = []
+        user_roles_map = {}
+
+        for guild, member in zip(guilds_to_check, results):
+            if member is not None:
+                mutual_guilds.append(guild)
+                # Получаем все роли кроме @everyone
+                role_ids = [role.id for role in member.roles if not role.is_default()]
+                if role_ids:
+                    user_roles_map[guild.id] = role_ids
+                    logger.debug(
+                        f"Пользователь имеет {len(role_ids)} ролей на сервере {guild.name}"
+                    )
+
+        logger.debug(f"Пользователь найден на {len(mutual_guilds)} серверах (параллельный запрос)")
+        return mutual_guilds, user_roles_map
+
     async def get_user_mutual_guilds(self, user_id: int) -> List[discord.Guild]:
         """
         Получить все сервера где есть и пользователь, и бот
@@ -202,24 +267,7 @@ class SyncEngine:
         Returns:
             Список объектов Guild
         """
-        mutual_guilds = []
-
-        for guild in self.bot.guilds:
-            # Пропускаем главный сервер
-            if guild.id == self.config.get_main_server_id():
-                continue
-
-            try:
-                member = await guild.fetch_member(user_id)
-                if member:
-                    mutual_guilds.append(guild)
-                    logger.debug(f"Пользователь найден на сервере {guild.name}")
-            except discord.NotFound:
-                continue
-            except Exception as e:
-                logger.warning(f"Ошибка проверки пользователя на сервере {guild.name}: {e}")
-                continue
-
+        mutual_guilds, _ = await self.get_user_roles_from_all_guilds(user_id)
         return mutual_guilds
 
     async def get_user_roles_from_guilds(
@@ -228,7 +276,7 @@ class SyncEngine:
         guilds: List[discord.Guild]
     ) -> Dict[int, List[int]]:
         """
-        Получить роли пользователя со всех указанных серверов
+        Получить роли пользователя со всех указанных серверов (параллельно)
 
         Args:
             user_id: ID пользователя
@@ -237,24 +285,23 @@ class SyncEngine:
         Returns:
             Словарь {server_id: [role_id1, role_id2, ...]}
         """
+        if not guilds:
+            return {}
+
+        # Параллельно запрашиваем всех участников
+        tasks = [self._fetch_member_safe(guild, user_id) for guild in guilds]
+        results = await asyncio.gather(*tasks)
+
         user_roles_map = {}
 
-        for guild in guilds:
-            try:
-                member = await guild.fetch_member(user_id)
-                if member:
-                    # Получаем все роли кроме @everyone
-                    role_ids = [role.id for role in member.roles if not role.is_default()]
-                    if role_ids:
-                        user_roles_map[guild.id] = role_ids
-                        logger.debug(
-                            f"Пользователь имеет {len(role_ids)} ролей на сервере {guild.name}"
-                        )
-            except Exception as e:
-                logger.warning(
-                    f"Ошибка получения ролей на сервере {guild.name}: {e}"
-                )
-                continue
+        for guild, member in zip(guilds, results):
+            if member is not None:
+                role_ids = [role.id for role in member.roles if not role.is_default()]
+                if role_ids:
+                    user_roles_map[guild.id] = role_ids
+                    logger.debug(
+                        f"Пользователь имеет {len(role_ids)} ролей на сервере {guild.name}"
+                    )
 
         return user_roles_map
 
@@ -327,16 +374,13 @@ class SyncEngine:
 
         # Получаем управляемые роли для удаления
         # ВАЖНО: удаляем только те роли, которые были добавлены через синхронизацию
-        # Для этого проверяем есть ли они в маппингах
+        # Используем обратный индекс для O(1) проверки
         if roles_to_remove_ids:
-            # Фильтруем только роли, которые есть в наших маппингах
-            mapped_role_ids = []
-            for role_id in roles_to_remove_ids:
-                # Проверяем есть ли эта роль в целевых ролях любого маппинга
-                for (_, _), target_id in self.role_mapper._mapping_cache.items():
-                    if target_id == role_id:
-                        mapped_role_ids.append(role_id)
-                        break
+            # Фильтруем только роли, которые есть в наших маппингах (O(1) через is_target_role)
+            mapped_role_ids = [
+                role_id for role_id in roles_to_remove_ids
+                if self.role_mapper.is_target_role(role_id)
+            ]
 
             if mapped_role_ids:
                 manageable_remove, _ = await get_manageable_roles(
@@ -495,9 +539,7 @@ class SyncEngine:
                     stats["failed"] += 1
 
                 # Небольшая задержка чтобы не превысить rate limit
-                await discord.utils.sleep_until(
-                    discord.utils.utcnow() + discord.utils.MISSING
-                )
+                await asyncio.sleep(0.5)
 
             except Exception as e:
                 logger.error(f"Ошибка синхронизации пользователя {member.id}: {e}")
